@@ -1,5 +1,1 @@
-.env
-*.log
-pycache/
-.DS_Store
-credentials.json
+
