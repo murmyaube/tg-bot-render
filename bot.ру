@@ -1,0 +1,537 @@
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, CallbackQueryHandler, ContextTypes
+import os
+import asyncio
+import time
+import sys
+
+# ==================== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ RENDER ====================
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
+
+# Проверка токена при запуске
+if not BOT_TOKEN:
+    print("❌ ОШИБКА: BOT_TOKEN не найден!")
+    print("💡 На Render добавь в Environment Variables:")
+    print("   Key: BOT_TOKEN")
+    print("   Value: твой_токен_бота")
+    sys.exit(1)
+
+if not GOOGLE_SHEET_ID:
+    print("⚠️ ПРЕДУПРЕЖДЕНИЕ: GOOGLE_SHEET_ID не найден")
+
+# НАСТРОЙКА ЛОГИРОВАНИЯ
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Состояния диалога
+CHOOSE_CATEGORY, SEARCH_PRODUCT, ENTER_QUANTITY, ENTER_CONTACTS = range(4)
+
+# ==================== GOOGLE SHEETS ФУНКЦИИ ====================
+
+def init_google_sheets():
+    """Инициализация подключения к Google Sheets"""
+    scope = [
+        'https://spreadsheets.google.com/feeds',
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    
+    # Проверяем наличие credentials.json
+    if not os.path.exists('credentials.json'):
+        print("❌ Файл credentials.json не найден!")
+        return None
+    
+    try:
+        creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+        client = gspread.authorize(creds)
+        print("✅ Google Sheets авторизация успешна")
+        return client
+    except Exception as e:
+        print(f"❌ Ошибка авторизации Google Sheets: {e}")
+        return None
+
+def load_products_from_sheet(sheet_name):
+    """Загрузка товаров с учетом уже заказанных"""
+    try:
+        client = init_google_sheets()
+        if not client:
+            print("❌ Не удалось инициализировать Google Sheets")
+            return []
+            
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except:
+            print(f"❌ Лист '{sheet_name}' не найден!")
+            return []
+        
+        data = worksheet.get_all_values()
+        
+        if not data or len(data) <= 1:
+            print(f"❌ Лист '{sheet_name}' пуст")
+            return []
+        
+        headers = data[0]
+        product_dict = {}
+        
+        name_idx = -1
+        quantity_idx = -1
+        ordered_idx = -1
+        box_idx = -1
+        id_idx = -1
+        desc_idx = -1
+        
+        for i, header in enumerate(headers):
+            header_lower = str(header).lower().strip()
+            
+            if any(word in header_lower for word in ['наименование', 'название', 'товар']):
+                name_idx = i
+            elif any(word in header_lower for word in ['кол-во', 'количество']):
+                quantity_idx = i
+            elif any(word in header_lower for word in ['заказано', 'резерв', 'бронь']):
+                ordered_idx = i
+            elif 'коробка' in header_lower:
+                box_idx = i
+            elif 'id' in header_lower or 'артикул' in header_lower:
+                id_idx = i
+            elif any(word in header_lower for word in ['описание', 'примечание', 'опис']):
+                desc_idx = i
+        
+        if ordered_idx == -1:
+            print(f"⚠️ Колонка 'Заказано' не найдена в листе '{sheet_name}'")
+        
+        print(f"📊 Лист '{sheet_name}': название[{name_idx}], кол-во[{quantity_idx}], заказано[{ordered_idx}]")
+
+        for row_idx, row in enumerate(data[1:], start=2):
+            if name_idx >= len(row) or not str(row[name_idx]).strip():
+                continue
+            
+            try:
+                product_name = str(row[name_idx]).strip()
+                
+                quantity = int(row[quantity_idx]) if quantity_idx < len(row) and str(row[quantity_idx]).strip() else 0
+                
+                ordered = int(row[ordered_idx]) if ordered_idx != -1 and ordered_idx < len(row) and str(row[ordered_idx]).strip() else 0
+                
+                available = max(0, quantity - ordered)
+                
+                product_id = str(row[id_idx]).strip() if id_idx < len(row) else ''
+                description = str(row[desc_idx]).strip() if desc_idx < len(row) else ''
+                
+                if product_name in product_dict:
+                    product_dict[product_name]['total_quantity'] += quantity
+                    product_dict[product_name]['ordered'] += ordered
+                    product_dict[product_name]['available'] = max(0, product_dict[product_name]['total_quantity'] - product_dict[product_name]['ordered'])
+                else:
+                    product_dict[product_name] = {
+                        'name': product_name,
+                        'total_quantity': quantity,
+                        'ordered': ordered,
+                        'available': available,
+                        'product_id': product_id,
+                        'description': description,
+                        'sheet_name': sheet_name,
+                        'ordered_col_idx': ordered_idx,
+                        'rows': []
+                    }
+                
+                product_dict[product_name]['rows'].append(row_idx)
+                
+            except Exception as e:
+                print(f"⚠️ Ошибка в строке {row_idx}: {e}")
+                continue
+        
+        product_data = list(product_dict.values())
+        
+        print(f"✅ Загружено {len(product_data)} товаров из '{sheet_name}'")
+        print(f"📦 Всего товаров: {sum(p['total_quantity'] for p in product_data)}, Заказано: {sum(p['ordered'] for p in product_data)}, Доступно: {sum(p['available'] for p in product_data)}")
+        
+        return product_data
+        
+    except Exception as e:
+        print(f"❌ Ошибка загрузки: {e}")
+        return []
+
+def update_ordered_quantity(sheet_name, product_name, additional_ordered, row_numbers):
+    """Обновление колонки 'Заказано' для товара"""
+    try:
+        client = init_google_sheets()
+        if not client:
+            return False
+            
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        worksheet = spreadsheet.worksheet(sheet_name)
+        
+        headers = worksheet.row_values(1)
+        ordered_idx = -1
+        
+        for i, header in enumerate(headers, start=1):
+            if any(word in str(header).lower() for word in ['заказано', 'резерв', 'бронь']):
+                ordered_idx = i
+                break
+        
+        if ordered_idx == -1:
+            print(f"⚠️ Создаю колонку 'Заказано' в листе '{sheet_name}'")
+            worksheet.update_cell(1, len(headers) + 1, 'Заказано')
+            ordered_idx = len(headers) + 1
+        
+        for row in row_numbers:
+            current_ordered = worksheet.cell(row, ordered_idx).value
+            if not current_ordered or not current_ordered.strip():
+                current_ordered = 0
+            else:
+                try:
+                    current_ordered = int(current_ordered)
+                except:
+                    current_ordered = 0
+            
+            new_ordered = current_ordered + additional_ordered
+            worksheet.update_cell(row, ordered_idx, new_ordered)
+        
+        print(f"✅ Обновлено 'Заказано' для '{product_name}': +{additional_ordered}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Ошибка обновления заказанного количества: {e}")
+        return False
+
+# ==================== ОСНОВНЫЕ ФУНКЦИИ БОТА ====================
+
+async def start(update: Update, context):
+    """Начало с предупреждением о б/у товарах"""
+    context.user_data.clear()
+    
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+    
+    warning_text = "⚠️ ВНИМАНИЕ! ⚠️\n\nВсе товары в этом магазине — Б/У (бывшие в употреблении).\n\nПродолжая, вы подтверждаете что ознакомлены с условиями."
+    
+    await message.reply_text(warning_text)
+    
+    await asyncio.sleep(1)
+    
+    keyboard = [
+        [InlineKeyboardButton("💻 Комплектующие (MAIN)", callback_data='main')],
+        [InlineKeyboardButton("⚡ Блоки питания (PSU)", callback_data='psu')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    category_text = "🎯 Выберите категорию товаров:\n\n• 💻 Комплектующие (MAIN) — материнские платы, процессоры, видеокарты\n• ⚡ Блоки питания (PSU) — блоки питания различной мощности\n\n👇 Нажмите на нужную категорию:"
+    
+    await message.reply_text(category_text, reply_markup=reply_markup)
+    
+    return CHOOSE_CATEGORY
+
+async def button_handler(update: Update, context):
+    """Обработка выбора категории"""
+    query = update.callback_query
+    await query.answer()
+    
+    category_map = {
+        'main': ('💻 Комплектующие', 'MAIN'),
+        'psu': ('⚡ Блоки питания', 'PSU')
+    }
+    
+    chosen = query.data
+    category_name, sheet_name = category_map.get(chosen, ('', ''))
+    
+    context.user_data['category'] = category_name
+    context.user_data['sheet_name'] = sheet_name
+    
+    await query.edit_message_text(f"{category_name}\n\nВведите название товара для поиска:")
+    
+    return SEARCH_PRODUCT
+
+async def search_product(update: Update, context):
+    """Поиск товара с учетом уже заказанных"""
+    user_input = update.message.text.strip().lower()
+    sheet_name = context.user_data.get('sheet_name', 'MAIN')
+    category_name = context.user_data.get('category', 'Комплектующие')
+    
+    products = load_products_from_sheet(sheet_name)
+    
+    if not products:
+        error_text = f"""⚠️ Категория временно недоступна
+
+Категория: {category_name}
+База товаров не загружена. Попробуйте позже."""
+        
+        keyboard = [[InlineKeyboardButton("🔄 Выбрать другую категорию", callback_data='new_search')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(error_text, reply_markup=reply_markup)
+        return CHOOSE_CATEGORY
+    
+    found_products = []
+    for product in products:
+        if user_input in product['name'].lower():
+            found_products.append(product)
+    
+    if found_products:
+        product = found_products[0]
+        context.user_data['product'] = product
+        context.user_data['product_rows'] = product.get('rows', [])
+        
+        product_info = f"""✅ Товар найден!
+
+📦 Название: {product['name']}
+🏷️ Категория: {category_name}
+📊 Всего на складе: {product['total_quantity']} шт.
+📦 Уже заказано: {product['ordered']} шт.
+✅ Доступно для заказа: {product['available']} шт."""
+        
+        if product.get('product_id'):
+            product_info += f"\n🔢 ID: {product['product_id']}"
+        
+        if product.get('description'):
+            product_info += f"\n📝 Примечание: {product['description']}"
+        
+        product_info += "\n\n🛒 Сколько штук вам нужно?"
+        
+        await update.message.reply_text(product_info)
+        return ENTER_QUANTITY
+        
+    else:
+        not_found_text = f"""❌ Товар не найден
+
+Категория: {category_name}
+По запросу "{user_input}" ничего не найдено.
+
+🔍 Советы:
+• Проверьте правильность написания
+• Используйте часть названия
+• Или выберите другую категорию"""
+        
+        keyboard = [[InlineKeyboardButton("🔄 Выбрать другую категорию", callback_data='new_search')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(not_found_text, reply_markup=reply_markup)
+        return SEARCH_PRODUCT
+
+async def get_quantity(update: Update, context):
+    """Обработка количества"""
+    try:
+        quantity = int(update.message.text)
+        product = context.user_data['product']
+        
+        if quantity <= 0:
+            await update.message.reply_text("❌ Введите положительное число:")
+            return ENTER_QUANTITY
+        elif quantity > product['available']:
+            stock_text = f"""⚠️ Недостаточно товара
+
+К сожалению, доступно только {product['available']} шт.
+(уже заказано: {product['ordered']} шт. из {product['total_quantity']} шт.)
+
+📦 Введите меньшее количество:"""
+            await update.message.reply_text(stock_text)
+            return ENTER_QUANTITY
+        else:
+            context.user_data['quantity'] = quantity
+            
+            contacts_text = """📞 Отлично!
+
+Теперь введите ваш номер телефона для связи:
+
+📱 Формат: +7XXX XXX-XX-XX или 8XXX XXX-XX-XX
+
+⏰ Менеджер свяжется с вами для подтверждения заказа"""
+            await update.message.reply_text(contacts_text)
+            return ENTER_CONTACTS
+            
+    except ValueError:
+        await update.message.reply_text("❌ Пожалуйста, введите корректное число:")
+        return ENTER_QUANTITY
+
+async def get_contacts(update: Update, context):
+    """Оформление заказа с обновлением заказанного количества"""
+    contacts = update.message.text
+    product = context.user_data['product']
+    quantity = context.user_data['quantity']
+    product_rows = context.user_data.get('product_rows', [])
+    category = context.user_data.get('category', 'Товар')
+    sheet_name = context.user_data.get('sheet_name', 'MAIN')
+    
+    update_success = update_ordered_quantity(sheet_name, product['name'], quantity, product_rows)
+    
+    order_text = f"""🎊 Запрос на покупку оформлен!
+
+📋 Детали запроса:
+├ 📦 Товар: {product['name']}
+├ 🏷️ Категория: {category}
+├ 🔢 Количество: {quantity} шт.
+└ 📞 Контакты: {contacts}
+
+{'✅ Количество обновлено в базе' if update_success else '⚠️ Не удалось обновить базу'}
+
+⏰ С вами свяжутся в ближайшее время!
+
+Спасибо за заказ! ❤️"""
+    
+    await update.message.reply_text(order_text)
+    
+    logger.info(f"📝 Запрос: {product['name']} - {quantity} шт. - {contacts} - Обновлено в базе: {update_success}")
+    
+    keyboard = [[InlineKeyboardButton("🔄 Новый поиск", callback_data='new_search')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text("Хотите найти еще товары?", reply_markup=reply_markup)
+    return ConversationHandler.END
+
+async def new_search_handler(update: Update, context):
+    """Обработчик кнопки 'Новый поиск' и 'Выбрать другую категорию'"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data.clear()
+    
+    warning_text = "⚠️ ВНИМАНИЕ! ⚠️\n\nВсе товары в этом магазине — Б/У (бывшие в употреблении).\n\nПродолжая, вы подтверждаете что ознакомлены с условиями."
+    
+    await query.message.reply_text(warning_text)
+    
+    await asyncio.sleep(1)
+    
+    keyboard = [
+        [InlineKeyboardButton("💻 Комплектующие (MAIN)", callback_data='main')],
+        [InlineKeyboardButton("⚡ Блоки питания (PSU)", callback_data='psu')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    category_text = "🎯 Выберите категорию товаров:\n\n• 💻 Комплектующие (MAIN) — материнские платы, процессоры, видеокарты\n• ⚡ Блоки питания (PSU) — блоки питания различной мощности\n\n👇 Нажмите на нужную категорию:"
+    
+    await query.message.reply_text(category_text, reply_markup=reply_markup)
+    return CHOOSE_CATEGORY
+
+async def cancel(update: Update, context):
+    await update.message.reply_text("🚫 Поиск отменен. Напишите /start чтобы начать заново.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def help_command(update: Update, context):
+    help_text = """🆘 Помощь по боту
+
+📌 Доступные команды:
+├ /start - начать поиск товара
+├ /help - показать эту справку
+└ /cancel - отменить текущий поиск
+
+💡 Как пользоваться:
+1. Начните с команды /start
+2. Выберите категорию товаров
+3. Введите название товара
+4. Укажите нужное количество
+5. Оставьте контакты для связи
+
+📞 Нужна помощь? Обращайтесь!"""
+    await update.message.reply_text(help_text)
+
+# ==================== ЗАПУСК ДЛЯ RENDER ====================
+
+def create_application():
+    """Создание приложения с обработчиками"""
+    try:
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        conv_handler = ConversationHandler(
+            entry_points=[
+                CommandHandler('start', start),
+                CallbackQueryHandler(new_search_handler, pattern='^new_search$')
+            ],
+            states={
+                CHOOSE_CATEGORY: [
+                    CallbackQueryHandler(button_handler, pattern='^(main|psu)$'),
+                    CallbackQueryHandler(new_search_handler, pattern='^new_search$')
+                ],
+                SEARCH_PRODUCT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, search_product),
+                    CallbackQueryHandler(new_search_handler, pattern='^new_search$')
+                ],
+                ENTER_QUANTITY: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity),
+                    CallbackQueryHandler(new_search_handler, pattern='^new_search$')
+                ],
+                ENTER_CONTACTS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, get_contacts),
+                    CallbackQueryHandler(new_search_handler, pattern='^new_search$')
+                ],
+            },
+            fallbacks=[
+                CommandHandler('cancel', cancel),
+                CommandHandler('start', start),
+                CallbackQueryHandler(new_search_handler, pattern='^new_search$')
+            ],
+            allow_reentry=True,
+            per_user=True,
+            per_chat=True
+        )
+        
+        application.add_handler(conv_handler)
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CallbackQueryHandler(new_search_handler, pattern='^new_search$'))
+        
+        return application
+    except Exception as e:
+        print(f"❌ Ошибка создания приложения: {e}")
+        raise
+
+def main():
+    """Основная функция запуска для Render"""
+    print(f"{'='*60}")
+    print("🤖 БОТ ДЛЯ Б/У ТОВАРОВ")
+    print(f"🚀 Запуск на Render: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📊 BOT_TOKEN: {'✅ Установлен' if BOT_TOKEN else '❌ Отсутствует'}")
+    print(f"📁 GOOGLE_SHEET_ID: {'✅ Установлен' if GOOGLE_SHEET_ID else '❌ Отсутствует'}")
+    print(f"{'='*60}")
+    
+    # Проверяем наличие файла credentials.json
+    if os.path.exists('credentials.json'):
+        print("✅ Файл credentials.json найден")
+    else:
+        print("❌ Файл credentials.json НЕ найден в корневой папке!")
+        print("💡 Убедись что credentials.json загружен на GitHub")
+    
+    try:
+        # Создаём приложение
+        application = create_application()
+        
+        # Запускаем polling (для Render достаточно polling)
+        print("🔄 Запуск бота через polling...")
+        
+        application.run_polling(
+            poll_interval=1.0,
+            timeout=30,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
+        
+    except KeyboardInterrupt:
+        print("\n🔴 Бот остановлен пользователем")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        print("🔄 Попытка перезапуска через 10 секунд...")
+        time.sleep(10)
+        
+        # Пытаемся перезапустить
+        os.execv(sys.executable, ['python'] + sys.argv)
+
+if __name__ == '__main__':
+    main()
